@@ -137,6 +137,17 @@ class Qwen3MemoryLayer(nn.Module):
         self.mem_v = nn.Parameter(
             torch.empty(config.mem_size, self.value_dim), requires_grad=False
         )
+        # Offline hybrid evaluation can restrict this static corpus bank to one
+        # request's retrieved document slots. Kept as a buffer so the eager
+        # model path can change it without reloading weights.
+        self.register_buffer("mem_active_indices", None, persistent=False)
+
+    def set_active_indices(self, indices: torch.Tensor | None) -> None:
+        if indices is not None:
+            if indices.dtype != torch.long:
+                indices = indices.to(dtype=torch.long)
+            indices = indices.to(device=self.mem_k.device, non_blocking=True)
+        self.mem_active_indices = indices
 
     def normalize_keys(self) -> None:
         if self.keys_are_normalized:
@@ -155,10 +166,14 @@ class Qwen3MemoryLayer(nn.Module):
         query, _ = self.mem_q_proj(hidden_states)
         query = query.view(-1, self.num_heads, self.key_dim)
         query = self.mem_q_norm(query)
+        keys, values = self.mem_k, self.mem_v
+        if self.mem_active_indices is not None:
+            keys = keys[self.mem_active_indices]
+            values = values[self.mem_active_indices]
         memory = chunked_memory_lookup(
             query,
-            self.mem_k,
-            self.mem_v,
+            keys,
+            values,
             self.top_k,
             self.chunk_size,
             self.temperature,

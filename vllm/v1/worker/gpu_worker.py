@@ -452,6 +452,81 @@ class Worker(WorkerBase):
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
 
+    def set_memory_active_indices(self, indices: list[int] | None) -> None:
+        """Restrict a Qwen3 memory-embedding bank for offline hybrid eval.
+
+        Requests must be serialized by the caller: this changes worker-global
+        model state and is intentionally not part of the public serving API.
+        """
+        model = self.model_runner.get_model()
+        tensor = None
+        if indices is not None:
+            tensor = torch.as_tensor(indices, dtype=torch.long, device=self.device)
+        for layer in model.model.layers:
+            memory = getattr(layer, "memory", None)
+            if memory is not None and hasattr(memory, "set_active_indices"):
+                memory.set_active_indices(tensor)
+
+    @torch.inference_mode()
+    def load_memory_slots(self, path: str, indices: list[int]) -> int:
+        """Patch a hybrid memory bank in place from a safetensors delta.
+
+        Used by the two-GPU JAX/vLLM RL path.  The JAX actor re-encodes the
+        retrieved documents after every optimizer update; only those active
+        slots need to cross to the resident vLLM engine.
+        """
+        from safetensors.torch import load_file
+
+        payload = load_file(path, device="cpu")
+        keys, values = payload["mem_k"], payload["mem_v"]
+        index = torch.as_tensor(indices, dtype=torch.long, device=self.device)
+        if len(index) != len(keys) or len(index) != len(values):
+            raise ValueError(
+                f"memory delta rows={len(keys)}/{len(values)} do not match indices={len(index)}"
+            )
+        model = self.model_runner.get_model()
+        for layer in model.model.layers:
+            memory = getattr(layer, "memory", None)
+            if memory is not None:
+                memory.mem_k.index_copy_(0, index, keys.to(device=self.device, dtype=memory.mem_k.dtype))
+                memory.mem_v.index_copy_(0, index, values.to(device=self.device, dtype=memory.mem_v.dtype))
+        return len(index)
+
+    @torch.inference_mode()
+    def load_memory_trainable_weights(self, path: str) -> int:
+        """Load only trainable memory-layer parameters without restarting vLLM."""
+        from safetensors.torch import load_file
+
+        payload = load_file(path, device="cpu")
+        params = dict(self.model_runner.get_model().named_parameters())
+        loaded = 0
+        for name, value in payload.items():
+            param = params.get(name)
+            if param is None:
+                # Qwen fuses the checkpoint's gate/up MLP projections into a
+                # single gate_up_proj parameter. The JAX LoRA exporter sends
+                # materialized HF-style gate_proj/up_proj tensors.
+                match = re.fullmatch(r"(model\.layers\.\d+\.mlp)\.(gate|up)_proj\.weight", name)
+                if match:
+                    fused = params.get(match.group(1) + ".gate_up_proj.weight")
+                    if fused is not None and fused.ndim == 2 and fused.shape[0] == 2 * value.shape[0]:
+                        start = 0 if match.group(2) == "gate" else value.shape[0]
+                        fused[start:start + value.shape[0]].copy_(
+                            value.to(device=fused.device, dtype=fused.dtype)
+                        )
+                        loaded += 1
+                        continue
+                raise KeyError(f"No vLLM parameter named {name!r} in memory delta")
+            # Native JAX stores scalar memory scale as shape (1,), while the
+            # vLLM module registers it as a rank-0 Parameter.
+            if param.ndim == 0 and value.numel() == 1:
+                value = value.reshape(())
+            if param.shape != value.shape:
+                raise ValueError(f"Shape mismatch for {name}: {tuple(value.shape)} != {tuple(param.shape)}")
+            param.copy_(value.to(device=param.device, dtype=param.dtype))
+            loaded += 1
+        return loaded
+
     def reload_weights(self, *args, **kwargs) -> None:
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.reload_weights(*args, **kwargs)
