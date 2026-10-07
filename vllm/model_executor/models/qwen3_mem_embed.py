@@ -58,7 +58,7 @@ def chunked_memory_lookup(
 
     for start in range(0, keys.shape[0], chunk_size):
         chunk = keys[start : start + chunk_size]
-        scores = torch.matmul(flat_query, chunk.t()) * scale
+        scores = torch.matmul(flat_query, chunk.t()).float() * scale
         if valid_mask is not None:
             scores = scores.masked_fill(~valid_mask[start:start + chunk_size], float("-inf"))
         chunk_k = min(top_k, chunk.shape[0])
@@ -90,7 +90,9 @@ def chunked_memory_lookup(
 
     weights = torch.where(selected_valid, weights, torch.zeros_like(weights)).to(query.dtype)
     selected_values = values[best_indices]
-    output = torch.sum(weights.unsqueeze(-1) * selected_values, dim=-2)
+    # BF16 dot products accumulate in FP32, matching JAX einsum; do not
+    # round every weight*value product to BF16 before the reduction.
+    output = torch.sum(weights.float().unsqueeze(-1) * selected_values.float(), dim=-2).to(query.dtype)
     return output.reshape(*query_shape[:-1], values.shape[-1])
 
 

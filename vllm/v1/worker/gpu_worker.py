@@ -218,6 +218,7 @@ class Worker(WorkerBase):
         Global worker state: callers must use max_num_seqs=1 and disable prefix
         caching, since cached hidden states depend on the selected bank.
         """
+        torch.cuda.reset_peak_memory_stats(self.device)
         tensor = torch.as_tensor(indices, dtype=torch.long, device=self.device)
         counts = []
         for layer in self.model_runner.get_model().model.layers:
@@ -228,6 +229,27 @@ class Worker(WorkerBase):
         if not counts:
             raise ValueError("Model has no memory layers")
         return {"active_slots": counts, "compiled_safe": True}
+
+    def get_memory_metrics(self) -> dict:
+        """Allocator and model/bank decomposition for offline benchmark reports."""
+        model = self.model_runner.get_model()
+        parameter_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+        corpus_bytes = active_bytes = 0
+        for layer in model.model.layers:
+            memory = getattr(layer, "memory", None)
+            if memory is not None:
+                corpus_bytes += sum(p.numel() * p.element_size() for p in (memory.mem_k, memory.mem_v))
+                active_bytes += sum(p.numel() * p.element_size() for p in (memory.active_keys, memory.active_values, memory.active_valid))
+        cache_bytes = sum(p.numel() * p.element_size() for p in getattr(self.model_runner, "kv_caches", []) if isinstance(p, torch.Tensor))
+        return {"worker_peak_torch_allocated_bytes": torch.cuda.max_memory_allocated(self.device),
+                "worker_peak_torch_reserved_bytes": torch.cuda.max_memory_reserved(self.device),
+                "worker_torch_allocated_bytes": torch.cuda.memory_allocated(self.device),
+                "worker_torch_reserved_bytes": torch.cuda.memory_reserved(self.device),
+                "model_parameters_including_corpus_bytes": parameter_bytes,
+                "reader_parameters_excluding_corpus_bytes": parameter_bytes - corpus_bytes,
+                "corpus_memory_bank_bytes": corpus_bytes,
+                "active_memory_buffers_bytes": active_bytes,
+                "kv_cache_tensor_bytes": cache_bytes}
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)

@@ -39,3 +39,13 @@ change logprobs; all five greedy token sequences agree between modes. Across 287
 logprobs the largest compiled/eager absolute difference was 0.003976, consistent with
 BF16 fused-operation rounding. This synthetic smoke does not establish trained-checkpoint
 parity; a trained-model probe is additionally required before paper runs.
+
+Additional trained validation (same H100): actual step900 reader A/B/empty/one/A
+passes in eager and compiled engines; all5 greedy token sequences match, with max
+absolute difference0.135401 across287 shared logprobs. A direct learned-memory
+projection/read/write test on2048 actual corpus slots against CPUJAX gives write
+relativeL2=0.009430 and cosine=0.999956. BF16 projection/RMS arithmetic differs
+slightly between frameworks. Weighted BF16 products now accumulate in FP32 before
+casting output, matching JAX einsum rather than rounding individual products.
+Worker telemetry exposes corpus/active buffers, reader parameters, KV cache and
+allocator peaks so a shared GPU reservation budget does not obscure actual footprint.
