@@ -212,6 +212,23 @@ class Worker(WorkerBase):
         with self._maybe_get_memory_pool_context(tag="weights"):
             self.model_runner.load_model(eep_scale_up=eep_scale_up)
 
+    def set_memory_active_indices(self, indices: list[int]) -> dict:
+        """Set one serialized request's memory bank without changing graph buffers.
+
+        Global worker state: callers must use max_num_seqs=1 and disable prefix
+        caching, since cached hidden states depend on the selected bank.
+        """
+        tensor = torch.as_tensor(indices, dtype=torch.long, device=self.device)
+        counts = []
+        for layer in self.model_runner.get_model().model.layers:
+            memory = getattr(layer, "memory", None)
+            if memory is not None:
+                memory.set_active_indices(tensor)
+                counts.append(memory.active_count)
+        if not counts:
+            raise ValueError("Model has no memory layers")
+        return {"active_slots": counts, "compiled_safe": True}
+
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
 
