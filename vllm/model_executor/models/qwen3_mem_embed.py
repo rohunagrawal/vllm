@@ -28,10 +28,19 @@ model copies it in (and builds the index) at the end of weight loading. ``set_me
 refills the buffers of an exact-retrieval model afterwards, but cannot rebuild a CAGRA index.
 
 Memory projections are not in the base Qwen3 checkpoint: they are randomly initialised
-(sigma 0.02, seeded by ``mem_init_seed``) unless a checkpoint provides ``mem_*`` tensors.
+(sigma 0.02, seeded by ``mem_init_seed``) unless the checkpoint provides the trained tensors
+(``model.layers.N.mem_layernorm.weight`` and ``model.layers.N.memory.{mem_q_proj,mem_q_norm,mem_o_proj,
+mem_k_norm}.weight``, as written by memory-layers ``vllm_export.py`` / ``export_relay.py``); then
+``mem_weights_loaded`` is True and ``MemoryBlock.mem_k_norm`` holds the key-norm weight that banks built
+outside vLLM are normalised with.
+
+``mem_masked_bank=True`` (exact retrieval only): ``mem_capacity`` is a maximum; the first ``bank_n`` slots are
+valid and ``set_memory_bank`` may be called again with fewer slots (in place, CUDA-graph safe), e.g. one bank
+per query. Unset (default) keeps the fixed-size path used by the evidence-size sweep unchanged.
 """
 
 import math
+import re
 from collections.abc import Iterable
 
 import torch
@@ -52,6 +61,10 @@ from .utils import PPMissingLayer, extract_layer_index, maybe_prefix
 _QUERY_CHUNK = 1024  # max query rows scored against the bank at a time
 _LOGITS_BUDGET = 3 << 29  # ~1.5 GiB of fp32 logits per chunk: rows shrink as the bank grows
 _EPS = 1e-6
+_MEM_WEIGHT_RE = re.compile(
+    r"^model\.layers\.(?P<layer>\d+)\.(?:memory\.)?(?P<leaf>mem_[a-z_]+)(?:\.weight)?$"
+)
+_MEM_LOADED_LEAVES = ("mem_q_proj", "mem_q_norm", "mem_o_proj", "mem_k_norm", "mem_layernorm")
 
 
 def _rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = _EPS) -> torch.Tensor:
@@ -75,6 +88,36 @@ def _mem_read(
         probs = torch.softmax(scores, dim=-1)
         outs.append(torch.einsum("qk,qkv->qv", probs, bank_v[idx].float()))
     return torch.cat(outs)
+
+
+def _mem_read_masked(
+    q: torch.Tensor, bank_k: torch.Tensor, bank_v: torch.Tensor, top_k: int, bank_n: torch.Tensor
+) -> torch.Tensor:
+    """As ``_mem_read`` over a bank whose first ``bank_n[0]`` slots are valid (the rest never win)."""
+    scale = 1.0 / math.sqrt(q.shape[-1])
+    chunk = max(1, min(_QUERY_CHUNK, _LOGITS_BUDGET // (4 * bank_k.shape[0])))
+    invalid = torch.arange(bank_k.shape[0], device=q.device) >= bank_n
+    outs = []
+    for part in q.split(chunk):
+        logits = (part @ bank_k.T).float() * scale
+        scores, idx = torch.topk(logits.masked_fill(invalid, float("-inf")), top_k, dim=-1)
+        probs = torch.softmax(scores, dim=-1)
+        outs.append(torch.einsum("qk,qkv->qv", probs, bank_v[idx].float()))
+    return torch.cat(outs)
+
+
+def _mem_read_masked_fake(
+    q: torch.Tensor, bank_k: torch.Tensor, bank_v: torch.Tensor, top_k: int, bank_n: torch.Tensor
+) -> torch.Tensor:
+    return torch.empty((q.shape[0], bank_v.shape[-1]), dtype=torch.float32, device=q.device)
+
+
+direct_register_custom_op(
+    op_name="mem_read_masked",
+    op_func=_mem_read_masked,
+    mutates_args=[],
+    fake_impl=_mem_read_masked_fake,
+)
 
 
 def _mem_read_fake(
@@ -147,9 +190,14 @@ class MemoryBlock(nn.Module):
         retrieval: str = "exact",
         cagra_itopk: int = 1024,
         cagra_candidates: int = 512,
+        layer_idx: int = -1,
+        masked: bool = False,
     ) -> None:
         super().__init__()
         assert retrieval in ("exact", "cagra"), retrieval
+        self.layer_idx = layer_idx
+        assert not (masked and retrieval == "cagra"), "a CAGRA bank is built once at full capacity"
+        self.masked = masked  # exact only: bank_n valid slots of `capacity`, refillable per query
         self.num_heads, self.k_dim, self.v_dim, self.top_k = num_heads, k_dim, v_dim, top_k
         self.retrieval, self.cagra_itopk, self.cagra_candidates = (
             retrieval,
@@ -163,12 +211,15 @@ class MemoryBlock(nn.Module):
             torch.empty(num_heads * k_dim, hidden_size, dtype=dtype), requires_grad=False
         )
         self.mem_q_norm = nn.Parameter(torch.ones(k_dim, dtype=dtype), requires_grad=False)
+        # Key norm weight, used only to normalise banks built outside vLLM (see load_trained).
+        self.register_buffer("mem_k_norm", torch.ones(k_dim, dtype=dtype), persistent=False)
         # fp32 output projection [num_heads * v_dim, hidden]: the reference reads in fp32.
         self.mem_o_proj_f32 = nn.Parameter(
             torch.empty(num_heads * v_dim, hidden_size, dtype=torch.float32), requires_grad=False
         )
         # Fixed-capacity bank; contents are replaced in place by set_memory_bank.
         self.capacity = capacity
+        self.register_buffer("bank_n", torch.full((1,), capacity, dtype=torch.int64), persistent=False)
         self.register_buffer("bank_k", torch.zeros(capacity, k_dim, dtype=dtype), persistent=False)
         # CAGRA builds its index from the keys only, and cuVS's NN-descent needs a second copy of the
         # dataset while building, so at millions of slots the value bank is allocated *after* the index
@@ -184,11 +235,26 @@ class MemoryBlock(nn.Module):
         for p in (self.mem_q_proj, self.mem_o_proj_f32):
             p.data.copy_(torch.randn(p.shape, generator=g, dtype=torch.float32).mul_(0.02))
 
+    def load_trained(self, t: dict[str, torch.Tensor]) -> None:
+        """Trained export tensors: q_proj [H*k, D], q_norm [k], o_proj [D, H*v], layernorm [D], k_norm [k]."""
+        self.mem_q_proj.data.copy_(t["mem_q_proj"])
+        self.mem_q_norm.data.copy_(t["mem_q_norm"])
+        self.mem_layernorm.data.copy_(t["mem_layernorm"])
+        self.mem_o_proj_f32.data.copy_(t["mem_o_proj"].float().T)  # [H*v, D], fp32 like the reference
+        if "mem_k_norm" in t:
+            self.mem_k_norm.copy_(t["mem_k_norm"])
+
     def load_bank(self, keys: torch.Tensor, values: torch.Tensor) -> None:
         """Fill the bank in place (keys already k-normalised); CAGRA blocks build their index here."""
-        assert keys.shape[0] == values.shape[0] == self.capacity, (
-            f"bank has {keys.shape[0]} slots, mem_capacity is {self.capacity}"
-        )
+        n = keys.shape[0]
+        assert n == values.shape[0], "keys/values slot counts differ"
+        if self.masked:
+            assert 0 < n <= self.capacity, f"bank has {n} slots, mem_capacity is {self.capacity}"
+            self.bank_k[:n].copy_(keys)
+            self.bank_v[:n].copy_(values)
+            self.bank_n.fill_(n)  # in place: captured CUDA graphs read the new count
+            return
+        assert n == self.capacity, f"bank has {n} slots, mem_capacity is {self.capacity}"
         self.bank_k.copy_(keys)  # direct cross-device copy: no full-size temporary on the GPU
         if self.retrieval == "cagra":
             assert self.cagra is None, "a built CAGRA index cannot be refilled in place"
@@ -216,6 +282,8 @@ class MemoryBlock(nn.Module):
             y = torch.ops.vllm.mem_read_cagra(
                 q, self.bank_k, self.bank_v, self.top_k, self.cagra_handle
             )
+        elif self.masked:
+            y = torch.ops.vllm.mem_read_masked(q, self.bank_k, self.bank_v, self.top_k, self.bank_n)
         else:
             y = torch.ops.vllm.mem_read(q, self.bank_k, self.bank_v, self.top_k)
         out = y.view(t, self.num_heads * self.v_dim) @ self.mem_o_proj_f32
@@ -245,6 +313,8 @@ class Qwen3MemEmbedDecoderLayer(Qwen3DecoderLayer):
                 retrieval=getattr(config, "mem_retrieval", "exact"),
                 cagra_itopk=getattr(config, "mem_cagra_itopk", 1024),
                 cagra_candidates=getattr(config, "mem_cagra_candidates", 512),
+                layer_idx=extract_layer_index(prefix),
+                masked=getattr(config, "mem_masked_bank", False),
             )
 
     def forward(
@@ -311,10 +381,35 @@ class Qwen3MemEmbedForCausalLM(Qwen3ForCausalLM):
         return [m for m in self.modules() if isinstance(m, MemoryBlock)]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loaded = super().load_weights(weights)
+        # Trained exports carry the memory tensors next to the Qwen3 ones (names as written by the
+        # memory-layers ``vllm_export.py``): ``model.layers.N.mem_layernorm.weight`` and
+        # ``model.layers.N.memory.{mem_q_proj,mem_q_norm,mem_o_proj,mem_k_norm}.weight``. The bank
+        # tensors (``memory.mem_k`` / ``memory.mem_v``) and the unused ``mem_layer_scale`` /
+        # ``mem_o_norm`` are skipped: banks are handed over with set_pending_memory_bank.
+        mem_tensors: dict[tuple[int, str], torch.Tensor] = {}
+
+        def split(it):
+            for name, w in it:
+                m = _MEM_WEIGHT_RE.match(name)
+                if m is None:
+                    yield name, w
+                    continue
+                leaf = m.group("leaf")
+                if leaf in _MEM_LOADED_LEAVES:
+                    mem_tensors[(int(m.group("layer")), leaf)] = w
+
+        loaded = super().load_weights(split(weights))
         seed = getattr(self.config, "mem_init_seed", 0)
+        self.mem_weights_loaded = False
         for i, block in enumerate(self.memory_blocks()):
-            block.init_random(seed + i)
+            layer = block.layer_idx
+            have = {leaf: mem_tensors[(layer, leaf)] for (l, leaf) in mem_tensors if l == layer}
+            if {"mem_q_proj", "mem_q_norm", "mem_o_proj", "mem_layernorm"} <= set(have):
+                block.load_trained(have)
+                self.mem_weights_loaded = True
+            else:
+                assert not have, f"layer {layer}: incomplete memory tensors {sorted(have)}"
+                block.init_random(seed + i)
         for name, _ in self.named_parameters():
             if ".memory." in name:
                 loaded.add(name)
