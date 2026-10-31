@@ -67,6 +67,8 @@ class CagraBank:
         graph_degree: int = 64,
         intermediate_graph_degree: int = 128,
         max_iterations: int = 0,
+        key_scale: torch.Tensor | None = None,
+        group=None,
     ) -> None:
         import cupy as cp
         import rmm
@@ -88,15 +90,33 @@ class CagraBank:
 
         # FP16 augmented dataset [n, dim + 128] = [key | sqrt(radius - |key|^2) | 127 zeros], built in
         # chunks so no full-size FP32 copy of the bank is ever materialised (matters at millions of keys).
-        step = 1 << 20
-        max_norm = max(keys[i : i + step].float().square().sum(-1).max() for i in range(0, self.n, step))
-        radius = max_norm + 1e-3
-        self.dataset = torch.zeros((self.n, self.dim + 128), dtype=torch.float16, device=keys.device)
+        self.quantized = key_scale is not None
+        step = 8192
+        def rows(i):
+            result = keys[i:i + step].float()
+            return result if key_scale is None else result * key_scale[i:i + step]
+        max_norm = torch.zeros((), device=keys.device)
         for i in range(0, self.n, step):
-            kf = keys[i : i + step].float()
-            self.dataset[i : i + step, : self.dim] = kf.half()
-            self.dataset[i : i + step, self.dim] = (radius - kf.square().sum(-1)).clamp_min(0).sqrt().half()
-            del kf
+            max_norm = torch.maximum(max_norm, rows(i).square().sum(-1).max())
+        if group is not None and group.world_size > 1:
+            torch.distributed.all_reduce(
+                max_norm, op=torch.distributed.ReduceOp.MAX, group=group.device_group
+            )
+        radius = max_norm + 1e-3
+        # One shared scale preserves the augmented L2 geometry. Query clipping
+        # is bounded by this same radius and must be evaluated for quality later.
+        self.search_scale = radius.sqrt().clamp_min(1e-12) / 127
+        dtype = torch.int8 if self.quantized else torch.float16
+        self.dataset = torch.zeros((self.n, self.dim + 128), dtype=dtype, device=keys.device)
+        for i in range(0, self.n, step):
+            kf = rows(i)
+            aug = torch.zeros((len(kf), self.dim + 128), device=keys.device)
+            aug[:, :self.dim] = kf
+            aug[:, self.dim] = (radius - kf.square().sum(-1)).clamp_min(0).sqrt()
+            if self.quantized:
+                aug = (aug / self.search_scale).round().clamp(-127, 127)
+            self.dataset[i:i + step] = aug.to(dtype)
+        del kf, aug
 
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -108,7 +128,7 @@ class CagraBank:
                     intermediate_graph_degree=intermediate_graph_degree,
                     build_algo="nn_descent",
                 ),
-                _cview(self.dataset, cp.float16),
+                _cview(self.dataset, cp.int8 if self.quantized else cp.float16),
                 resources=self.resources,
             )
         self.resources.sync()
@@ -132,7 +152,11 @@ class CagraBank:
             )
         dist_t, nbr_t = self._buffers[rows]
         aug = torch.cat([q.float(), torch.zeros((rows, 128), device=q.device)], -1)
-        aug = aug.half().contiguous()
+        if self.quantized:
+            aug = (aug / self.search_scale).round().clamp(-127, 127).to(torch.int8)
+        else:
+            aug = aug.half()
+        aug = aug.contiguous()
         cur = torch.cuda.current_stream()
         self.stream.wait_stream(cur)  # fork
         aug.record_stream(self.stream)
@@ -140,7 +164,7 @@ class CagraBank:
             self._cagra.search(
                 self.params,
                 self.index,
-                _cview(aug, cp.float16),
+                _cview(aug, cp.int8 if self.quantized else cp.float16),
                 self.candidates,
                 distances=_cview(dist_t, cp.float32),
                 neighbors=_cview(nbr_t, cp.uint32),
@@ -150,4 +174,5 @@ class CagraBank:
         return nbr_t
 
     def memory_bytes(self) -> dict[str, int]:
-        return dict(dataset_fp16=self.dataset.numel() * 2)
+        return {"dataset_int8" if self.quantized else "dataset_fp16":
+                self.dataset.numel() * self.dataset.element_size()}

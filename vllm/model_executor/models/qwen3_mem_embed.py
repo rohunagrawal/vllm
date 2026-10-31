@@ -147,11 +147,30 @@ def _mem_read_cagra(
         local = bank.search(part)  # [r, candidates] int32, -1 invalid
         valid = local >= 0
         ids = local.clamp_min(0).long()
-        dots = torch.bmm(bank_k[ids], part.unsqueeze(-1)).squeeze(-1).float() * scale
+        candidate_keys = bank_k[ids]
+        if bank_k.dtype == torch.int8:
+            candidate_keys = (candidate_keys.float() * bank.key_scale[ids]).to(part.dtype)
+        dots = torch.bmm(candidate_keys, part.unsqueeze(-1)).squeeze(-1).float() * scale
         scores, which = torch.topk(dots.masked_fill(~valid, float("-inf")), top_k, dim=-1)
         ids = ids.gather(-1, which)
-        probs = torch.softmax(scores, dim=-1)
-        outs.append(torch.einsum("qk,qkv->qv", probs, bank_v[ids].float()))
+        group = getattr(bank, "group", None)
+        if group is not None and group.world_size > 1:
+            # Exchange only local top-k scores. The gathered position identifies
+            # the owning rank and its local top-k slot; IDs stay on their owner.
+            all_scores = group.all_gather(scores, dim=-1)
+            global_scores, positions = all_scores.topk(top_k, dim=-1)
+            probabilities = torch.softmax(global_scores, dim=-1)
+            weights = torch.zeros_like(all_scores).scatter(-1, positions, probabilities)
+            probs = weights[:, group.rank_in_group * top_k:(group.rank_in_group + 1) * top_k]
+        else:
+            probs = torch.softmax(scores, dim=-1)
+        selected_values = bank_v[ids].float()
+        if bank_v.dtype == torch.int8:
+            selected_values = selected_values * bank.value_scale[ids]
+        read = torch.einsum("qk,qkv->qv", probs, selected_values)
+        if group is not None and group.world_size > 1:
+            read = group.all_reduce(read)
+        outs.append(read)
     return torch.cat(outs)
 
 
@@ -192,9 +211,28 @@ class MemoryBlock(nn.Module):
         cagra_candidates: int = 512,
         layer_idx: int = -1,
         masked: bool = False,
+        bank_int8: bool = False,
+        bank_shard: bool = False,
     ) -> None:
         super().__init__()
         assert retrieval in ("exact", "cagra"), retrieval
+        self.bank_group = None
+        self.global_capacity = capacity
+        self.bank_start = 0
+        if bank_shard:
+            from vllm.distributed import get_tp_group
+            if retrieval != "cagra" or masked:
+                raise ValueError("Bank sharding requires unmasked CAGRA retrieval")
+            self.bank_group = get_tp_group()
+            rank, world = self.bank_group.rank_in_group, self.bank_group.world_size
+            self.bank_start = capacity * rank // world
+            end = capacity * (rank + 1) // world
+            capacity = end - self.bank_start
+            if capacity < top_k or cagra_candidates < top_k:
+                raise ValueError("Each shard and candidate budget must contain at least top_k rows")
+        self.bank_int8 = bank_int8
+        if bank_int8 and (retrieval != "cagra" or masked):
+            raise ValueError("INT8 memory banks require unmasked CAGRA retrieval")
         self.layer_idx = layer_idx
         assert not (masked and retrieval == "cagra"), "a CAGRA bank is built once at full capacity"
         self.masked = masked  # exact only: bank_n valid slots of `capacity`, refillable per query
@@ -220,7 +258,7 @@ class MemoryBlock(nn.Module):
         # Fixed-capacity bank; contents are replaced in place by set_memory_bank.
         self.capacity = capacity
         self.register_buffer("bank_n", torch.full((1,), capacity, dtype=torch.int64), persistent=False)
-        self.register_buffer("bank_k", torch.zeros(capacity, k_dim, dtype=dtype), persistent=False)
+        self.register_buffer("bank_k", torch.zeros(0 if bank_int8 else capacity, k_dim, dtype=torch.int8 if bank_int8 else dtype), persistent=False)
         # CAGRA builds its index from the keys only, and cuVS's NN-descent needs a second copy of the
         # dataset while building, so at millions of slots the value bank is allocated *after* the index
         # exists (load_bank). Exact retrieval has no such peak and keeps the buffer from the start.
@@ -246,6 +284,12 @@ class MemoryBlock(nn.Module):
 
     def load_bank(self, keys: torch.Tensor, values: torch.Tensor) -> None:
         """Fill the bank in place (keys already k-normalised); CAGRA blocks build their index here."""
+        if self.bank_group is not None:
+            if keys.shape[0] == self.global_capacity:
+                sl = slice(self.bank_start, self.bank_start + self.capacity)
+                keys, values = keys[sl], values[sl]
+            elif keys.shape[0] != self.capacity:
+                raise ValueError("Expected a full bank or this rank's local shard")
         n = keys.shape[0]
         assert n == values.shape[0], "keys/values slot counts differ"
         if self.masked:
@@ -255,6 +299,25 @@ class MemoryBlock(nn.Module):
             self.bank_n.fill_(n)  # in place: captured CUDA graphs read the new count
             return
         assert n == self.capacity, f"bank has {n} slots, mem_capacity is {self.capacity}"
+        if self.bank_int8:
+            if self.cagra is not None:
+                raise ValueError("An INT8 CAGRA bank cannot be refilled")
+            for name, source in (("k", keys), ("v", values)):
+                target = torch.empty(source.shape, dtype=torch.int8, device=self.bank_k.device)
+                scales = torch.empty((n, 1), dtype=torch.float32, device=target.device)
+                for start in range(0, n, 8192):
+                    rows = source[start:start + 8192].to(device=target.device, dtype=torch.float32)
+                    scale = (rows.abs().amax(-1, keepdim=True) / 127).clamp_min(1e-12)
+                    target[start:start + 8192] = (rows / scale).round().clamp(-127, 127).to(torch.int8)
+                    scales[start:start + 8192] = scale
+                setattr(self, "bank_" + name, target)
+                self.register_buffer("bank_" + name + "_scale", scales, persistent=False)
+                del rows, scale
+                if name == "k":
+                    self.build_cagra()
+            self.cagra.key_scale = self.bank_k_scale
+            self.cagra.value_scale = self.bank_v_scale
+            return
         self.bank_k.copy_(keys)  # direct cross-device copy: no full-size temporary on the GPU
         if self.retrieval == "cagra":
             assert self.cagra is None, "a built CAGRA index cannot be refilled in place"
@@ -269,8 +332,10 @@ class MemoryBlock(nn.Module):
 
     def build_cagra(self) -> None:
         self.cagra = CagraBank(
-            self.bank_k, itopk=self.cagra_itopk, candidates=self.cagra_candidates
+            self.bank_k, itopk=self.cagra_itopk, candidates=self.cagra_candidates,
+            key_scale=getattr(self, "bank_k_scale", None), group=self.bank_group
         )
+        self.cagra.group = self.bank_group
         self.cagra_handle = self.cagra.handle
 
     def forward(self, h: torch.Tensor) -> torch.Tensor:
@@ -315,6 +380,8 @@ class Qwen3MemEmbedDecoderLayer(Qwen3DecoderLayer):
                 cagra_candidates=getattr(config, "mem_cagra_candidates", 512),
                 layer_idx=extract_layer_index(prefix),
                 masked=getattr(config, "mem_masked_bank", False),
+                bank_int8=getattr(config, "mem_bank_int8", False),
+                bank_shard=getattr(config, "mem_bank_shard", False),
             )
 
     def forward(
@@ -363,6 +430,11 @@ class Qwen3MemEmbedForCausalLM(Qwen3ForCausalLM):
         self.model = Qwen3MemEmbedModel(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
+        if not self.memory_blocks():
+            raise RuntimeError(
+                "No memory blocks were constructed. Check the Qwen3 decoder-layer "
+                "factory and mem_layers configuration before benchmarking."
+            )
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -414,7 +486,12 @@ class Qwen3MemEmbedForCausalLM(Qwen3ForCausalLM):
             if ".memory." in name:
                 loaded.add(name)
         global _PENDING_BANK
-        if _PENDING_BANK is not None:
+        bank_path = getattr(self.config, "mem_bank_path", None)
+        if bank_path is not None:
+            # mmap keeps each worker's CPU/GPU loading bounded to its own rows.
+            payload = torch.load(bank_path, map_location="cpu", mmap=True, weights_only=True)
+            self.set_memory_bank(payload["keys"], payload["values"])
+        elif _PENDING_BANK is not None:
             self.set_memory_bank(*_PENDING_BANK)
             _PENDING_BANK = None
         elif any(b.retrieval == "cagra" for b in self.memory_blocks()):
